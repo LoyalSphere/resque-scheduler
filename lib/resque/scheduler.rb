@@ -52,10 +52,17 @@ module Resque
 
         begin
           @th = Thread.current
+          @pid = Process.pid
+          @hostname = hostname
+
+          health_check_key = "resque-scheduler-health-#{@hostname}:#{@pid}"
+
+          cleanup_and_register(health_check_key)
 
           # Now start the scheduling part of the loop.
           loop do
-            Resque.redis.set('resque-scheduler-health', Time.now.to_i)
+            Resque.redis.set(health_check_key, Time.now.to_i, ex: 60)
+
             begin
               # Check on changes to master/child
               @am_master = master?
@@ -81,8 +88,33 @@ module Resque
         rescue Interrupt
           log 'Exiting'
         ensure
-          Resque.redis.del('resque-scheduler-health')
+          Resque.redis.multi do |transaction|
+            transaction.del(health_check_key)
+            transaction.srem('resque-scheduler-instances', "#{@hostname}:#{@pid}")
+          end
         end
+      end
+
+      def cleanup_and_register(health_check_key)
+          # get process id and hostname
+
+          # clean up old workers that might have been orphaned
+          # by a lost connection
+          removed = []
+          Resque.redis.smembers('resque-scheduler-instances').each do |id|
+            if !Resque.redis.get("resque-scheduler-health-#{id}")
+              log "removing stale hearthbeat #{id}"
+              removed << id
+            end
+          end
+
+          Resque.redis.multi do |transaction|
+            for id in removed
+              transaction.srem('resque-scheduler-instances', id)
+            end
+            transaction.set(health_check_key, Time.now.to_i, ex: 60)
+            transaction.sadd('resque-scheduler-instances', "#{@hostname}:#{@pid}")
+          end
       end
 
       def print_schedule
@@ -429,6 +461,13 @@ module Resque
       end
 
       private
+
+      def hostname
+        local_hostname = Socket.gethostname
+        Socket.gethostbyname(local_hostname).first
+      rescue
+        local_hostname
+      end
 
       def enqueue_recurring(name, config)
         if am_master
